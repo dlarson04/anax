@@ -38,7 +38,8 @@ type NodeSearch struct {
 	retryLookBack        uint64          // The amount of time to look backward for node changes when node retries are happening.
 	policyOrder          bool            // When true, order policies most recently changed to least recently changed.
 	clearExchangeCache   bool            // When true, the exchange cache will be deleted after a seach is made with devices returned.
-	completedSearches    map[string]bool //Keeps track of the patterns/policies that have been searched to eliminate rescans until all are searched
+	completedSearches    map[string]bool // Keeps track of the patterns/policies that have been searched to eliminate rescans until all are searched
+	fullRescan           bool            // Flag for a full rescan in progress
 }
 
 func NewNodeSearch() *NodeSearch {
@@ -51,6 +52,7 @@ func NewNodeSearch() *NodeSearch {
 		rescanNeeded:        false,
 		clearExchangeCache:  false,
 		completedSearches:   make(map[string]bool),
+		fullRescan:          false,
 	}
 	return ns
 }
@@ -133,6 +135,11 @@ func (n *NodeSearch) Scan() {
 		n.lastSearchTime = uint64(time.Now().Unix())
 		glog.V(3).Infof(AWlogString("Polling Exchange (full rescan)"))
 		n.lastSearchComplete = false
+
+		// Settings to indicate a full rescan is needed
+		n.fullRescan = true
+		n.completedSearches = make(map[string]bool)
+
 		go n.findAndMakeAgreements()
 	}
 
@@ -169,6 +176,9 @@ func (n *NodeSearch) findAndMakeAgreements() {
 	// If all patterns/policies completely searched clear map so next time through, search can start searches from full list again
 	doClearSearchedMap := true
 
+	// If fullRescan, use this instead of the policuUpdateTime
+	currentTime := uint64(time.Now().Unix())
+
 	for _, org := range allOrgs {
 
 		// The policies in the policy manager are generated from patterns and deployment policies. Order the policies
@@ -191,11 +201,15 @@ func (n *NodeSearch) findAndMakeAgreements() {
 						searchError = true
 						break
 					} else {
-						glog.V(5).Infof(AWlogString(fmt.Sprintf("Adding pattern %s as searched", org+"_"+consumerPolicy.Header.Name)))
+						if glog.V(5) {
+							glog.Infof(AWlogString(fmt.Sprintf("Adding pattern %s as searched", org+"_"+consumerPolicy.Header.Name)))
+						}
 						n.completedSearches[org+"_"+consumerPolicy.Header.Name] = true
 					}
 				} else {
-					glog.V(5).Infof(AWlogString(fmt.Sprintf("Would have searched %s again... skipping", consumerPolicy.PatternId)))
+					if glog.V(5) {
+						glog.Infof(AWlogString(fmt.Sprintf("Would have searched %s again... skipping", consumerPolicy.PatternId)))
+					}
 				}
 			} else if pBE := businessPolManager.GetBusinessPolicyEntry(org, &consumerPolicy); pBE != nil {
 				_, polName := cutil.SplitOrgSpecUrl(consumerPolicy.Header.Name)
@@ -206,8 +220,13 @@ func (n *NodeSearch) findAndMakeAgreements() {
 				//Check to see if we have already searched this policy... makes sure we check other policies before circling back and repeating re-searching ones we already did
 				_, ok := n.completedSearches[pBE_hash] // Use the hash since the policy may get updated which would change the hash but not the name. Do want to search changed/new policies
 
+				timeToUse := pBE.Updated
+	  			if n.fullRescan == true {
+					timeToUse = currentTime
+				}
+
 				if !ok {
-					if lastPage, err := n.searchNodesAndMakeAgreements(&consumerPolicy, org, polName, pBE.Updated); err != nil {
+					if lastPage, err := n.searchNodesAndMakeAgreements(&consumerPolicy, org, polName, timeToUse); err != nil {
 						// Dont move the changed since time forward since there was an error.
 						searchError = true
 						break
@@ -220,11 +239,15 @@ func (n *NodeSearch) findAndMakeAgreements() {
 						doClearSearchedMap = false
 						break
 					} else {
-						glog.V(5).Infof(AWlogString(fmt.Sprintf("Adding policy %s as searched", consumerPolicy.Header.Name)))
+						if glog.V(5) {
+							glog.Infof(AWlogString(fmt.Sprintf("Adding policy %s as searched", consumerPolicy.Header.Name)))
+						}
 						n.completedSearches[pBE_hash] = true
 					}
 				} else {
-					glog.V(5).Infof(AWlogString(fmt.Sprintf("Would have searched %s again... skipping", consumerPolicy.Header.Name)))
+					if glog.V(5) {
+						glog.Infof(AWlogString(fmt.Sprintf("Would have searched %s again... skipping", consumerPolicy.Header.Name)))
+					}
 				}
 			}
 
@@ -242,6 +265,7 @@ func (n *NodeSearch) findAndMakeAgreements() {
 	if doClearSearchedMap {
 		glog.V(3).Infof(AWlogString(fmt.Sprintf("OK to clear search map; length of map %d", len(n.completedSearches))))
 		n.completedSearches = make(map[string]bool)
+		n.fullRescan = false   // Clear to indicate full rescan complete
 	}
 
 	// Dump search tables to the log.
@@ -311,7 +335,9 @@ func (n *NodeSearch) searchNodesAndMakeAgreements(consumerPolicy *policy.Policy,
 
 		// For each Scan(), clear the cache only once when there are devices returned from the search api.
 		if n.clearExchangeCache && len(*devices) != 0 {
-			glog.V(5).Infof("Clearing cache for all resources.")
+			if glog.V(5) {
+				glog.Infof("Clearing cache for all resources.")
+			}
 			exchange.ClearAllResourceCache()
 			n.clearExchangeCache = false
 		}
@@ -319,17 +345,23 @@ func (n *NodeSearch) searchNodesAndMakeAgreements(consumerPolicy *policy.Policy,
 		for _, dev := range *devices {
 
 			glog.V(3).Infof(AWlogString(fmt.Sprintf("picked up %v for policy %v.", dev.ShortString(), consumerPolicy.Header.Name)))
-			glog.V(5).Infof(AWlogString(fmt.Sprintf("picked up %v", dev)))
+			if glog.V(5) {
+				glog.Infof(AWlogString(fmt.Sprintf("picked up %v", dev)))
+			}
 
 			// Check for agreements already in progress with this device
 			if found := n.alreadyMakingAgreementWith(&dev, consumerPolicy, ags); found {
-				glog.V(5).Infof(AWlogString(fmt.Sprintf("skipping device id %v, agreement attempt already in progress with %v", dev.Id, consumerPolicy.Header.Name)))
+				if glog.V(5) {
+					glog.Infof(AWlogString(fmt.Sprintf("skipping device id %v, agreement attempt already in progress with %v", dev.Id, consumerPolicy.Header.Name)))
+				}
 				continue
 			}
 
 			// If the device is not ready to make agreements yet, then skip it.
 			if dev.PublicKey == "" {
-				glog.V(5).Infof(AWlogString(fmt.Sprintf("skipping device id %v, node is not ready to exchange messages", dev.Id)))
+				if glog.V(5) {
+					glog.Infof(AWlogString(fmt.Sprintf("skipping device id %v, node is not ready to exchange messages", dev.Id)))
+				}
 				continue
 			}
 
